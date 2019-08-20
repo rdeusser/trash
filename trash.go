@@ -28,7 +28,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-var Version string = "v0.3.0-dev"
+var Version = "v0.3.0-dev"
 
 func main() {
 	app := cli.NewApp()
@@ -289,11 +289,11 @@ func updateTransitiveVendor(keep, update bool, trashDir, dir, targetDir string, 
 				if err != nil {
 					return extraImports, err
 				}
-				if imports, err := updateTransitiveVendor(keep, update, trashDir, dir, targetDir, &config, insecure, alreadyImported); err != nil {
+				imports, err := updateTransitiveVendor(keep, update, trashDir, dir, targetDir, &config, insecure, alreadyImported)
+				if err != nil {
 					return extraImports, err
-				} else {
-					extraImports = append(extraImports, imports...)
 				}
+				extraImports = append(extraImports, imports...)
 				extraImports = append(extraImports, config.Imports...)
 			}
 		}
