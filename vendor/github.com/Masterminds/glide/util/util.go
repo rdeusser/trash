@@ -312,6 +312,16 @@ func GetBuildContext() (*BuildCtxt, error) {
 //
 // FIXME: Is this deprecated?
 func NormalizeName(name string) (string, string) {
+	// Fastpath check if a name in the GOROOT. There is an issue when a pkg
+	// is in the GOROOT and GetRootFromPackage tries to look it up because it
+	// expects remote names.
+	b, err := GetBuildContext()
+	if err == nil {
+		p := filepath.Join(b.GOROOT, "src", name)
+		if _, err := os.Stat(p); err == nil {
+			return toSlash(name), ""
+		}
+	}
 
 	name = toSlash(name)
 	root := GetRootFromPackage(name)
