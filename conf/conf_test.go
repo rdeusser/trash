@@ -5,41 +5,48 @@ import (
 )
 
 func TestDuplicates(t *testing.T) {
-
 	testData := []struct {
 		imports    []Import
 		duplicates int
 	}{
 		{[]Import{
-			{"package1", "version1", ""},
+			{Package: "package1", Version: "version1"},
 		}, 0},
 		{[]Import{
-			{"package1", "version1", ""},
-			{"package2", "version1", "repoA"},
+			{Package: "package1", Version: "version1"},
+			{Package: "package2", Version: "version1", Repo: "repoA"},
 		}, 0},
 		{[]Import{
-			{"package1", "version1", ""},
-			{"package2", "version1", "repoA"},
-			{"package1", "version1", ""},
+			{Package: "package1", Version: "version1"},
+			{Package: "package2", Version: "version1", Repo: "repoA"},
+			{Package: "package1", Version: "version1"},
 		}, 1},
 		{[]Import{
-			{"package1", "version1", ""},
-			{"package2", "version1", "repoA"},
-			{"package1", "version1", ""},
-			{"package1", "version1", ""},
+			{Package: "package1", Version: "version1"},
+			{Package: "package2", Version: "version1", Repo: "repoA"},
+			{Package: "package1", Version: "version1"},
+			{Package: "package1", Version: "version1"},
 		}, 2},
 		{[]Import{
-			{"package1", "version1", ""},
-			{"package2", "version1", "repoA"},
-			{"package1", "version1", ""},
-			{"package1", "version1", ""},
-			{"package2", "version2", "repoB"},
-			{"package3", "version1", "repoA"},
+			{Package: "package1", Version: "version1"},
+			{Package: "package2", Version: "version1", Repo: "repoA"},
+			{Package: "package1", Version: "version1"},
+			{Package: "package1", Version: "version1"},
+			{Package: "package2", Version: "version2", Repo: "repoB"},
+			{Package: "package3", Version: "version1", Repo: "repoA"},
 		}, 3},
 	}
 
 	for i, d := range testData {
-		trash := Conf{"", d.imports, nil, nil, "", false}
+		trash := Conf{
+			Package:   "",
+			Imports:   d.imports,
+			Excludes:  []string{},
+			Packages:  []string{},
+			ImportMap: make(map[string]Import),
+			confFile:  "",
+			yamlType:  false,
+		}
 		trash.Dedupe()
 
 		if d.duplicates != len(d.imports)-len(trash.Imports) {

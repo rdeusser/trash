@@ -15,12 +15,16 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/rdeusser/trash/conf"
+	"github.com/rdeusser/trash/util"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/Masterminds/glide/godep"
-	"github.com/rancher/trash/conf"
-	"github.com/rancher/trash/util"
+	"github.com/Masterminds/semver"
+	"github.com/Masterminds/vcs"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/urfave/cli"
 	"gopkg.in/yaml.v2"
 )
 
@@ -28,32 +32,33 @@ var Version string = "v0.3.0-dev"
 
 func main() {
 	app := cli.NewApp()
+	app.Name = "trash"
 	app.Version = Version
 	app.Author = "@imikushin, @ibuildthecloud"
 	app.Usage = "Vendor imported packages and throw away the trash!"
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "file, f",
-			Value: "vendor.conf",
 			Usage: "Vendored packages list",
+			Value: "vendor.conf",
 		},
 		cli.StringFlag{
 			Name:  "directory, C",
-			Value: ".",
 			Usage: "The directory in which to run, --file is relative to this",
+			Value: ".",
 		},
 		cli.StringFlag{
 			Name:  "target, T",
-			Value: "vendor",
 			Usage: "The directory to store results",
+			Value: "vendor",
 		},
 		cli.BoolFlag{
 			Name:  "keep, k",
 			Usage: "Keep all downloaded vendor code (preserving .git dirs)",
 		},
-		cli.StringSliceFlag{
+		cli.BoolFlag{
 			Name:  "update, u",
-			Usage: "specify a list of packages to be updated",
+			Usage: "Update all packages",
 		},
 		cli.BoolFlag{
 			Name:  "insecure",
@@ -76,7 +81,7 @@ func main() {
 		},
 		cli.BoolFlag{
 			Name:  "include-vendor",
-			Usage: "whether to include vendor when running trash -k",
+			Usage: "Whether to include vendor when running trash -k",
 		},
 	}
 	app.Action = runWrapper
@@ -107,12 +112,7 @@ func run(c *cli.Context) error {
 	trashDir := c.String("cache")
 	gopath = c.String("gopath")
 	includeVendor := c.Bool("include-vendor")
-
-	update := false
-	updateVendor := c.StringSlice("update")
-	if len(updateVendor) > 0 {
-		update = true
-	}
+	update := c.Bool("update")
 
 	trashDir, err := filepath.Abs(trashDir)
 	if err != nil {
@@ -150,19 +150,18 @@ func run(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	trashFile := trashConf.ConfFile()
 
 	if update {
-		imports := []conf.Import{}
-		for _, imp := range updateVendor {
-			for k, existingImp := range trashConf.ImportMap {
-				if strings.Contains(k, imp) {
-					existingImp.Update = true
-					imports = append(imports, existingImp)
-				}
-			}
+		var wg errgroup.Group
+		wg.Go(func() error {
+			return updateTrash(trashDir, dir, targetDir, trashFile, trashConf, insecure)
+		})
+		if err := wg.Wait(); err != nil {
+			return err
 		}
-		trashConf.Imports = imports
 	}
+
 	alreadyImported := map[string]bool{}
 	extraImports, err := updateTransitiveVendor(keep, update, trashDir, dir, targetDir, trashConf, insecure, alreadyImported)
 	if err != nil {
@@ -194,7 +193,8 @@ func run(c *cli.Context) error {
 	}
 	trashConf.Imports = append(trashConf.Imports, filteredExtraImports...)
 
-	if err := vendor(keep, update, trashDir, dir, targetDir, trashConf, insecure); err != nil {
+	err = vendor(keep, update, trashDir, dir, targetDir, trashConf, insecure)
+	if err != nil {
 		return err
 	}
 
@@ -269,7 +269,7 @@ func updateTransitiveVendor(keep, update bool, trashDir, dir, targetDir string, 
 				continue
 			}
 			alreadyImported[packageImport.Package] = true
-			if update && !packageImport.Update {
+			if update && packageImport.Lock {
 				continue
 			}
 			repoDir := path.Join(trashDir, "src", packageImport.Package)
@@ -366,9 +366,11 @@ func updateTrash(trashDir, dir, targetDir, trashFile string, trashConf *conf.Con
 		if !ok {
 			i = conf.Import{Package: pkg}
 		}
-		i.Version, err = getLatestVersion(libRoot, pkg)
-		if err != nil {
-			return err
+		if !i.Lock {
+			i.Version, err = getLatestVersion(libRoot, pkg)
+			if err != nil {
+				return err
+			}
 		}
 		os.Chdir(dir)
 		trashConf.Imports = append(trashConf.Imports, i)
@@ -394,15 +396,52 @@ func topLevel(pkg, libRoot string) (string, error) {
 }
 
 func getLatestVersion(libRoot, pkg string) (string, error) {
-	if err := os.Chdir(filepath.Join(libRoot, pkg)); err != nil {
+	local := filepath.Join(libRoot, pkg)
+	if err := os.Chdir(local); err != nil {
 		return "", err
 	}
-	bytes, err := exec.Command("git", "describe", "--tags", "--always").Output()
+
+	repo, err := vcs.NewGitRepo("", local)
+	if err != nil {
+		return "", errors.Wrapf(err, "remote: %s, local: %s", repo.Remote(), local)
+	}
+
+	_, err = exec.Command("git", "fetch", "--tags", "--force").Output()
 	if err != nil {
 		return "", err
 	}
-	s := strings.TrimSpace(string(bytes))
-	return s, nil
+
+	bytes, err := exec.Command("git", "tags").Output()
+	if err != nil {
+		return "", err
+	}
+	tags := strings.Split(strings.TrimSpace(string(bytes)), "\n")
+
+	if len(tags) == 0 {
+		return repo.Current()
+	}
+
+	sortedTags := make([]*semver.Version, 0)
+	for _, t := range tags {
+		tag := string(t)
+		v, err := semver.NewVersion(tag)
+		if err == semver.ErrInvalidSemVer {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		sortedTags = append(sortedTags, v)
+	}
+
+	if len(sortedTags) == 0 {
+		return repo.Current()
+	}
+
+	sort.Sort(semver.Collection(sortedTags))
+	latestTag := sortedTags[len(sortedTags)-1].Original()
+
+	return strings.TrimSpace(latestTag), nil
 }
 
 func vendor(keep, update bool, trashDir, dir, targetDir string, trashConf *conf.Conf, insecure bool) error {
@@ -419,7 +458,7 @@ func vendor(keep, update bool, trashDir, dir, targetDir string, trashConf *conf.
 	os.Setenv("GOPATH", trashDir)
 
 	for _, i := range trashConf.Imports {
-		if update && !i.Update {
+		if update && i.Lock {
 			continue
 		}
 		prepareCache(trashDir, i, insecure)
@@ -430,8 +469,9 @@ func vendor(keep, update bool, trashDir, dir, targetDir string, trashConf *conf.
 	if update {
 		logrus.Info("Moving deps...")
 		for _, i := range trashConf.Imports {
-			if i.Update {
-				if err := mv(vendorDir, trashDir, i); err != nil {
+			if !i.Lock {
+				err := mv(vendorDir, trashDir, i)
+				if err != nil {
 					return err
 				}
 			}
@@ -443,7 +483,8 @@ func vendor(keep, update bool, trashDir, dir, targetDir string, trashConf *conf.
 
 		logrus.Info("Copying deps...")
 		for _, i := range trashConf.Imports {
-			if err := cpy(vendorDir, trashDir, i); err != nil {
+			err := cpy(vendorDir, trashDir, i)
+			if err != nil {
 				return err
 			}
 		}
@@ -498,14 +539,14 @@ func checkout(trashDir string, i conf.Import) {
 	logrus.WithFields(logrus.Fields{"trashDir": trashDir, "i": i}).Debug("entering checkout")
 	repoDir := path.Join(trashDir, "src", i.Package)
 	if err := os.Chdir(repoDir); err != nil {
-		logrus.Fatalf("Could not change to dir '%s'", repoDir)
+		logrus.Fatalf(wrapErrorf(err, "Could not change to dir '%s'", repoDir))
 	}
 	logrus.Infof("Checking out '%s', commit: '%s'", i.Package, i.Version)
 	version := i.Version
 	if i.Version == "master" || isBranch(remoteName(i.Repo), i.Version) {
 		version = remoteName(i.Repo) + "/" + i.Version
 		if err := fetch(i); err != nil {
-			logrus.WithFields(logrus.Fields{"i": i}).Fatalf("fetch failed")
+			logrus.WithFields(logrus.Fields{"i": i}).Fatalf(wrapErrorf(err, "fetch failed"))
 		}
 	}
 	if bytes, err := exec.Command("git", "checkout", "-f", "--detach", version).CombinedOutput(); err != nil {
@@ -518,11 +559,11 @@ func checkout(trashDir string, i conf.Import) {
 			}
 			version = strings.Fields(strings.TrimSpace(string(bytes)))[0]
 		} else if err := fetch(i); err != nil {
-			logrus.WithFields(logrus.Fields{"i": i}).Fatalf("fetch failed")
+			logrus.WithFields(logrus.Fields{"i": i}).Fatalf(wrapErrorf(err, "fetch failed"))
 		}
 		logrus.Debugf("Retrying!: `git checkout -f --detach %s`", version)
 		if bytes, err := exec.Command("git", "checkout", "-f", "--detach", version).CombinedOutput(); err != nil {
-			logrus.Fatalf("`git checkout -f --detach %s` failed:\n%s", version, bytes)
+			logrus.Fatalf(wrapErrorf(err, "`git checkout -f --detach %s` failed:\n%s", version, bytes))
 		}
 	}
 }
@@ -554,10 +595,9 @@ func checkGitRepo(trashDir, repoDir string, i conf.Import, insecure bool) error 
 	if err := os.Chdir(repoDir); err != nil {
 		if os.IsNotExist(err) {
 			return cloneGitRepo(trashDir, repoDir, i, insecure)
-		} else {
-			logrus.Errorf("repoDir '%s' cannot be CD'ed to", repoDir)
-			return err
 		}
+		logrus.Errorf("repoDir '%s' cannot be CD'ed to", repoDir)
+		return err
 	}
 	if !isCurrentDirARepo(trashDir) {
 		os.Chdir(trashDir)
@@ -995,15 +1035,6 @@ func cleanup(update bool, dir, targetDir string, trashConf *conf.Conf) error {
 
 	imports := collectImports(rootPackage, targetDir, targetDir)
 	var updatePackages map[string]bool
-	if update {
-		updatePackages = make(map[string]bool)
-		for _, i := range trashConf.Imports {
-			if i.Update {
-				updatePackages[i.Package] = true
-			}
-		}
-		logrus.Infof("Updated packages %v", updatePackages)
-	}
 	if err := removeExcludes(trashConf.Excludes, targetDir); err != nil {
 		logrus.Errorf("Error removing excluded dirs: %v", err)
 	}
@@ -1041,4 +1072,8 @@ func cleanup(update bool, dir, targetDir string, trashConf *conf.Conf) error {
 	}
 	os.RemoveAll(path.Join(dir, "trash.lock"))
 	return ioutil.WriteFile("trash.lock", data, 0755)
+}
+
+func wrapErrorf(err error, format string, args ...interface{}) string {
+	return errors.Wrapf(err, format, args...).Error()
 }

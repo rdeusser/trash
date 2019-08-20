@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
-	yaml "github.com/cloudfoundry-incubator/candiedyaml"
+	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
 )
 
 type Conf struct {
@@ -22,10 +22,10 @@ type Conf struct {
 }
 
 type Import struct {
-	Package string `yaml:"package,omitempty"`
-	Version string `yaml:"version,omitempty"`
+	Package string `yaml:"package"`
+	Version string `yaml:"version"`
 	Repo    string `yaml:"repo,omitempty"`
-	Update  bool   `yaml:"-"`
+	Lock    bool   `yaml:"lock,omitempty"`
 	Options `yaml:",inline"`
 }
 
@@ -63,7 +63,7 @@ func Parse(path string) (*Conf, error) {
 	defer file.Close()
 
 	trashConf := &Conf{confFile: path}
-	if yaml.NewDecoder(file).Decode(trashConf) == nil {
+	if err := yaml.NewDecoder(file).Decode(trashConf); err == nil {
 		trashConf.yamlType = true
 		trashConf.Dedupe()
 		return trashConf, nil
